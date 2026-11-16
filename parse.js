@@ -233,51 +233,72 @@ function validEmailDomain(domain) {
 }
 
 /**
- * Trim trailing punctuation off an autolink token, per the GFM autolink rules:
- * trailing ?!.,:;*_~'" are dropped; a trailing &word; entity is dropped whole;
- * trailing ')' are dropped while they outnumber '('.
+ * marked's GFM `_backpedal` (applied repeatedly until stable): keep runs of
+ * ordinary chars and balanced `(...)` groups, drop a trailing run of
+ * punctuation (unless it reaches the end of the token) and a trailing
+ * `&word;` entity. This is what decides e.g. that `https://a.io/foo(bar`
+ * links only `https://a.io/foo`, while `https://a.io/foo(bar)` links whole
+ * and `www.example.com]` links with the `]` in it.
  */
-function trimAutolink(tok) {
-  for (;;) {
-    if (!tok) return tok;
-    const last = tok[tok.length - 1];
-    if (last === ';') {
-      // a trailing &word; entity is dropped whole, before ';' is treated as
-      // plain trailing punctuation
-      const amp = tok.lastIndexOf('&');
-      if (amp >= 0 && /^&\w+;$/.test(tok.slice(amp))) { tok = tok.slice(0, amp); continue; }
-      tok = tok.slice(0, -1); continue;
-    }
-    if ('?!.,:*_~\'"'.indexOf(last) >= 0) { tok = tok.slice(0, -1); continue; }
-    if (last === ')') {
-      let open = 0, close = 0;
-      for (let i = 0; i < tok.length; i++) {
-        if (tok[i] === '(') open++;
-        else if (tok[i] === ')') close++;
-      }
-      if (close > open) { tok = tok.slice(0, -1); continue; }
-      return tok;
-    }
-    return tok;
-  }
+const BACKPEDAL_RE = /(?:[^?!.,:;*_'\"~()&]+|\([^)]*\)|&(?![a-zA-Z0-9]+;$)|[?!.,:;*_'\"~)]+(?!$))+/;
+function backpedal(tok) {
+  let prev;
+  do {
+    prev = tok;
+    const m = BACKPEDAL_RE.exec(tok);
+    tok = m ? m[0] : '';
+  } while (tok !== prev);
+  return tok;
 }
 
-/** Try a www. / scheme:// / scheme:email autolink starting at s[i] (letter).
- * When inBrackets is true the URL stops at ']' so a closing bracket can
- * still form a link (marked tries link before url); outside brackets a ']'
- * is a normal URL character. */
-function matchExtended(s, i, inBrackets) {
+/** True if any node in the list (or its descendants) is a bracket-formed link (autolinks do not count). */
+function hasLink(nodes) {
+  for (const n of nodes) {
+    if (n.t === 'link' && n.bracket) return true;
+    if (n.c && hasLink(n.c)) return true;
+  }
+  return false;
+}
+
+/**
+ * If tok (an autolink token starting at s[i]) contains a ']' that would
+ * close the innermost open bracket into a link, truncate tok there so the
+ * link can still form (marked tries the link before the url). If the
+ * bracket would not form a link (bad destination, no ref, or its label
+ * already holds a link), the ']' stays part of the URL.
+ */
+function truncateAtLinkBracket(s, i, tok, brackets, refs, nodes) {
+  if (!brackets.length) return tok;
+  const close = tok.indexOf(']');
+  if (close < 0) return tok;
+  // an unescaped '[' before the ']' opens a new bracket, so the ']'
+  // does not close the innermost one
+  for (let q = 0; q < close; q++) {
+    if (tok[q] === '[') {
+      let bs = 0;
+      for (let r = q - 1; r >= 0 && tok[r] === '\\'; r--) bs++;
+      if (bs % 2 === 0) return tok;
+    }
+  }
+  const b = brackets[brackets.length - 1];
+  if (!tryLink(s, i + close, b, refs)) return tok;
+  if (hasLink(nodes.slice(b.idx + 1))) return tok;
+  return tok.slice(0, close);
+}
+
+/** Try a www. / scheme:// / scheme:email autolink starting at s[i] (letter). */
+function matchExtended(s, i, brackets, refs, nodes) {
   const n = s.length;
   if (s[i] === 'w') {
     if (s.slice(i, i + 4) === 'www.') {
       let j = i + 4;
-      while (j < n && s[j] !== ' ' && s[j] !== '\t' && s[j] !== '\n' && s[j] !== '<' && s[j] !== '>' && s[j] !== '"' && !(inBrackets && s[j] === ']')) j++;
-      let tok = trimAutolink(s.slice(i, j));
+      while (j < n && s[j] !== ' ' && s[j] !== '\t' && s[j] !== '\n' && s[j] !== '<' && s[j] !== '>' && s[j] !== '"') j++;
+      let tok = backpedal(truncateAtLinkBracket(s, i, s.slice(i, j), brackets, refs, nodes));
       if (tok.length > 4) {
         const rest = tok.slice(4);
-        const cut = rest.search(/[/ ?#]/);
-        const domain = cut < 0 ? rest : rest.slice(0, cut);
-        if (domain[0] !== '.' && validEmailDomain(domain)) {
+        const dm = rest.match(/^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*/);
+        const domain = dm ? dm[0] : '';
+        if (domain && validEmailDomain(domain)) {
           return { href: 'http://' + tok, text: tok, end: i + tok.length };
         }
       }
@@ -289,8 +310,8 @@ function matchExtended(s, i, inBrackets) {
   if (j > i + 1 && j < n && s[j] === ':') {
     if (s[j + 1] === '/' && s[j + 2] === '/') {
       let k = j + 3;
-      while (k < n && s[k] !== ' ' && s[k] !== '\t' && s[k] !== '\n' && s[k] !== '<' && s[k] !== '>' && s[k] !== '"' && !(inBrackets && s[k] === ']')) k++;
-      const tok = trimAutolink(s.slice(i, k));
+      while (k < n && s[k] !== ' ' && s[k] !== '\t' && s[k] !== '\n' && s[k] !== '<' && s[k] !== '>' && s[k] !== '"') k++;
+      const tok = backpedal(truncateAtLinkBracket(s, i, s.slice(i, k), brackets, refs, nodes));
       if (tok.length > j - i + 3) return { href: tok, text: tok, end: i + tok.length };
       return null;
     }
@@ -312,7 +333,7 @@ function matchExtended(s, i, inBrackets) {
           while (m < n && s[m] !== ' ' && s[m] !== '\t' && s[m] !== '\n' && s[m] !== '<' && s[m] !== '>' && s[m] !== '"' && s[m] !== '/') m++;
           if (m > k + 1) end = m;
         }
-        let tok = trimAutolink(s.slice(i, end));
+        let tok = backpedal(s.slice(i, end));
         // the trim must not eat into the email itself (scheme + user@domain)
         if (tok.length >= j + 1 + (k - us)) {
           return { href: tok, text: tok, end: i + tok.length };
@@ -743,7 +764,8 @@ function tryDelAt(children, idx, s) {
     if (c.t !== 'delim' || c.len <= 0 || c.ch !== '~') continue;
     if (c.pos > u) break;
     if (c.len !== o) continue;
-    const cls = emScanClass(emCls(c.pCh), emCls(afterCharOf(c, s)), '~');
+    const aCh = afterCharOf(c, s);
+    const cls = emScanClass(emCls(c.pCh), aCh === undefined ? 'end' : emCls(aCh), '~');
     if (cls === 0) continue;
     if (cls === 'open') { p += c.len; continue; }
     p -= c.len;
@@ -942,15 +964,7 @@ function parseInline(s, refs) {
       i += 2;
       continue;
     }
-/** True if any node in the list (or its descendants) is a link. */
-/** True if the nodes contain a bracket-formed link (autolinks do not count). */
-function hasLink(nodes) {
-  for (const n of nodes) {
-    if (n.t === 'link' && n.bracket) return true;
-    if (n.c && hasLink(n.c)) return true;
-  }
-  return false;
-}
+
 
 /**
  * Replace extended autolinks (www/scheme/email) with their plain text:
@@ -1129,7 +1143,7 @@ function unwrapExtended(nodes) {
     if (isAsciiLetter(ch)) {
       const prev = i > 0 ? s[i - 1] : '';
       if (!prev || isSpace(prev) || '([{<*~"\'`,;:!?/={})]'.indexOf(prev) >= 0) {
-        const au = inLinkState ? null : matchExtended(s, i, brackets.length > 0);
+        const au = inLinkState ? null : matchExtended(s, i, brackets, refs, nodes);
         if (au) {
           flush();
           const link = { t: 'link', href: cleanUrl(au.href), title: null, c: [], p: root, extended: true };
