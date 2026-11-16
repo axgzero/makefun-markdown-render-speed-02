@@ -1849,12 +1849,20 @@ function phase2(st, li, s, pos, col) {
         // a tab in the leading whitespace of fenced-code content expands
         // to spaces by its column, when the fence is inside a container
         // (list item or blockquote); at the top level it stays a tab.
-        // Nested blockquotes count only the outermost '>' towards the
-        // column: each further level contributes 2 fewer columns.
+        // The column is the absolute column, except after a blockquote
+        // marker inside a list item: marked strips the item indent first,
+        // so the `>` sits at column 0 of the stripped line and the tab
+        // after `> ` is at column 2 (2 spaces), not at the absolute
+        // column. So when a quote is in the stack, measure the column
+        // relative to the innermost list item's content column.
         const inContainer = st.stack.length > 0;
         if (inContainer) {
-          const quotes = st.stack.reduce((a, e) => a + (e.kind === 'quote' ? 1 : 0), 0);
-          let col = adv.col - 2 * Math.max(0, quotes - 1);
+          let col = adv.col;
+          if (st.stack.some(e => e.kind === 'quote')) {
+            for (let k = st.stack.length - 1; k >= 0; k--) {
+              if (st.stack[k].kind === 'item') { col = adv.col - st.stack[k].contentCol; break; }
+            }
+          }
           if (col < 0) col = 0;
           let p = 0;
           let expanded = '';
