@@ -1450,8 +1450,29 @@ function closeContainers(st, k) {
 function pushLazyLine(st, m) {
   const fail = st.stack[m.k];
   if (fail && fail.kind === 'item') {
-    const adv = consumeCols(m.s, m.pos, m.col, Math.max(0, fail.contentCol - m.col));
-    st.para.lines.push(adv.s.slice(adv.pos));
+    // A line that reaches the item's content indent is a proper
+    // continuation: strip the content indent. A lazy line (indent below
+    // it) is kept verbatim in the item text — but when the item text is
+    // re-lexed, a line starting with 4+ spaces is absorbed as indented
+    // code into the open paragraph, which strips 4 spaces. The content
+    // indent is measured from the item's baseCol (where the outer
+    // containers ended when the item opened), not from m.col: a `>`
+    // strips 1 column on the item line (`>17.`) but 2 on a continuation
+    // line (`>    x`), so m.col varies per line.
+    const need = fail.contentCol - fail.baseCol;
+    const ind = indentCols(m.s, m.pos, m.col);
+    if (need <= 0 || ind.cols >= need) {
+      const strip = Math.max(0, fail.contentCol - m.col);
+      const adv = consumeCols(m.s, m.pos, m.col, strip);
+      st.para.lines.push(adv.s.slice(adv.pos));
+    } else {
+      let line = m.s.slice(m.pos);
+      if (ind.cols >= 4) {
+        const adv = consumeCols(m.s, m.pos, m.col, 4);
+        line = adv.s.slice(adv.pos);
+      }
+      st.para.lines.push(line);
+    }
     st.lazyPrev = null;
     return;
   }
@@ -1849,20 +1870,12 @@ function phase2(st, li, s, pos, col) {
         // a tab in the leading whitespace of fenced-code content expands
         // to spaces by its column, when the fence is inside a container
         // (list item or blockquote); at the top level it stays a tab.
-        // The column is the absolute column, except after a blockquote
-        // marker inside a list item: marked strips the item indent first,
-        // so the `>` sits at column 0 of the stripped line and the tab
-        // after `> ` is at column 2 (2 spaces), not at the absolute
-        // column. So when a quote is in the stack, measure the column
-        // relative to the innermost list item's content column.
+        // Nested blockquotes count only the outermost '>' towards the
+        // column: each further level contributes 2 fewer columns.
         const inContainer = st.stack.length > 0;
         if (inContainer) {
-          let col = adv.col;
-          if (st.stack.some(e => e.kind === 'quote')) {
-            for (let k = st.stack.length - 1; k >= 0; k--) {
-              if (st.stack[k].kind === 'item') { col = adv.col - st.stack[k].contentCol; break; }
-            }
-          }
+          const quotes = st.stack.reduce((a, e) => a + (e.kind === 'quote' ? 1 : 0), 0);
+          let col = adv.col - 2 * Math.max(0, quotes - 1);
           if (col < 0) col = 0;
           let p = 0;
           let expanded = '';
