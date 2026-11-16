@@ -1948,9 +1948,11 @@ function phase2(st, li, s, pos, col) {
       const after = endLine + 1;
       if (after >= st.lines.length) {
         if (st.srcEndsWithNewline) text += '\n';
-      } else if (!isBlankFrom(st.lines[after], 0)) {
-        // the trailing newline is kept only if the next line stays inside
-        // this container (a following block outside it ends the block cleanly)
+      } else if (st.lines[after].length > 0) {
+        // the trailing newline is kept when the next line is not truly
+        // empty — a whitespace-only line (e.g. a tab) still counts, only
+        // a zero-length line ends the block cleanly — and it stays inside
+        // this container (a following block outside it ends it cleanly)
         const lc = matchContainers(st, after, false);
         if (lc) text += '\n';
       }
