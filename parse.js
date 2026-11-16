@@ -505,6 +505,20 @@ function tryInlineLink(s, after) {
 }
 
 /**
+ * marked's GFM link-label regex `re` (anchored): a label is consumable as
+ * balanced `[...]` pairs, escaped chars, code spans (backtick run, no
+ * backticks inside, backtick run), a `` `` `` run right before the closing
+ * `]`, or any char except `[` `]` `\` backtick. A lone backtick (or a
+ * `` ` `` run that cannot close a code span) makes the label unusable, so
+ * the link does not form — e.g. `[a ` b ` c](x)` forms but
+ * `[a `` b ` c `` d](x)` does not.
+ */
+const LABEL_VALID_RE = /^(?:\[(?:\[(?:\\[\s\S]|[^\[\]\\])*\]|\\[\s\S]|[^\[\]\\])*\]|\\[\s\S]|`+(?!`)[^`]*?`+(?!`)|``+(?=\])|[^\[\]\\`])*?\]$/;
+function validLabel(s, labelStart, j) {
+  return LABEL_VALID_RE.test(s.slice(labelStart, j) + ']');
+}
+
+/**
  * Try to resolve a link at ']' (index j in s) for bracket b.
  * Returns {dest, title, end} with the raw destination/title, or null.
  * A failed inline link falls back to the shortcut reference link.
@@ -514,7 +528,7 @@ function tryLink(s, j, b, refs) {
   const labelStart = b.start + (b.image ? 2 : 1); // after '[' (or '![' for images)
   if (s[after] === '(') {
     const inl = tryInlineLink(s, after);
-    if (inl) return inl;
+    if (inl && validLabel(s, labelStart, j)) return inl;
     // fall through to the shortcut reference link
   } else if (s[after] === '[') {
     let q = after + 1;
@@ -531,6 +545,7 @@ function tryLink(s, j, b, refs) {
     if (label === '') label = rawTextBetween(s, labelStart, j);
     const ref = refs.get(normLabel(label));
     if (!ref) return null;
+    if (!validLabel(s, labelStart, j)) return null;
     return { dest: ref.dest, title: ref.title, end: q + 1, ref: true };
   }
   const label = rawTextBetween(s, labelStart, j);
