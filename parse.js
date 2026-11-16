@@ -542,89 +542,276 @@ function killDelims(children) {
   }
 }
 
-function isAncestor(a, b) {
-  let p = b.p;
-  while (p) { if (p === a) return true; p = p.p; }
-  return false;
+/**
+ * Marked-style emphasis resolution (marked 18.1.3 emStrong/del), ported from
+ * the vendored source. The CommonMark delimiter stack cannot reproduce
+ * marked on `*X **Y**Z*` (marked leaves the outer em literal when the inner
+ * ** closer is followed by a letter), so this re-implements marked's
+ * per-opener forward scan: for each opener run, scan later runs of the same
+ * char, classifying each by its surrounding characters, with the m/f
+ * counters, the rule of 3, the R flag (opener can also close) and the o flag
+ * (previous char is the same delimiter). Leftovers of the opener/closer
+ * runs go INSIDE the formed em/strong and are resolved recursively; a failed
+ * opener is retried one char shorter (consumed as literal text) until the
+ * run is exhausted. Delimiters are resolved per children list (one scope),
+ * recursing into link children and into formed em/strong/del nodes.
+ */
+
+/** Character class for the GFM emphasis scans. '~' is its own class here. */
+function emCls(ch) {
+  if (ch === undefined || ch === '') return 'none';
+  if (ch === '~') return 'tilde';
+  if (isSpace(ch)) return 'space';
+  if (isPunct(ch)) return 'punct';
+  return 'word';
 }
 
 /**
- * Move the nodes between opener and closer into dest (an em/strong/del node).
- * Handles the case where the closer sits inside a link (the link node is moved
- * whole) and where the opener sits inside a link and the closer outside (the
- * search climbs out of the link, pulling following nodes into the emphasis).
+ * Scan class of a delimiter run from its before/after classes:
+ * 'close' (marked groups 1/2), 'open' (groups 3/4), 'amb' (groups 5/6),
+ * or 0 (invisible to the scan). The group-3 alternative takes a punct-or-
+ * space before-char for '*' and '~' (punctSpace) but a space-only
+ * before-char for '_' (GFM '_' has no group 6 at all: a '_' run between
+ * two word chars, or after punctuation before a word, is invisible).
+ * For '*' the '~' char is special (marked's GFM '*' regex treats '~' as a
+ * word char for notPunctSpace but as punctuation for punct/punctSpace);
+ * for '_' and '~' it counts as punct.
  */
-function collectBetween(opener, closer, dest) {
-  let parent = opener.p;
-  let idx = parent.c.indexOf(opener) + 1;
-  for (;;) {
-    while (idx >= parent.c.length) {
-      if (parent.t === 'root') return;
-      const grand = parent.p;
-      idx = grand.c.indexOf(parent) + 1;
-      parent = grand;
+function emScanClass(b, a, ch) {
+  if (ch === '*') {
+    if (b === 'tilde') {
+      if (a === 'space' || a === 'end') return 'close';
+      if (a === 'punct') return 'close';
+      if (a === 'word' || a === 'tilde') return 'amb';
+      return 0;
     }
-    const node = parent.c[idx];
-    if (node === closer) return;
-    if (isAncestor(node, closer)) {
-      parent.c.splice(idx, 1);
-      node.p = dest;
-      dest.c.push(node);
-      return;
+    if (a === 'tilde') {
+      if (b === 'punct') return 'open';
+      if (b === 'word') return 'amb';
+      if (b === 'space') return 'open';
+      return 0;
     }
-    parent.c.splice(idx, 1);
-    node.p = dest;
-    dest.c.push(node);
   }
+  const bb = b === 'tilde' ? 'punct' : b;
+  const aa = a === 'tilde' ? 'punct' : a;
+  if (bb === 'punct' && (aa === 'space' || aa === 'end')) return 'close';
+  if (bb === 'word' && (aa === 'punct' || aa === 'space' || aa === 'end')) return 'close';
+  if (bb === 'space' && aa === 'word') return 'open';
+  if (bb === 'space' && aa === 'punct') return 'open';
+  if (bb === 'punct' && aa === 'punct') return 'amb';
+  if (bb === 'punct' && aa === 'word') return 'open';
+  if (ch !== '_' && bb === 'word' && aa === 'word') return 'amb';
+  return 0;
 }
 
-/** Resolve the delimiter stack into em/strong/del nodes (CommonMark appendix). */
-function processEmphasis(delims) {
-  let i = 0;
-  while (i < delims.length) {
-    const closer = delims[i];
-    if (closer.len === 0 || closer.dead || !closer.canClose) { i++; continue; }
-/** Nearest link ancestor of a node, or null (emphasis may not cross a link). */
-function linkAncestor(node) {
-  let p = node.p;
-  while (p) { if (p.t === 'link') return p; p = p.p; }
+/** marked's inline `punctuation` rule (nt): space or punctuation, not * _. */
+function isPunctNt(ch) {
+  return ch !== undefined && ch !== '' && ch !== '*' && ch !== '_' && (isSpace(ch) || isPunct(ch));
+}
+
+const OPEN_QUOTE_RE = /[\p{Pi}\p{Ps}"']/u;
+const ALNUM_RE = /[\p{L}\p{N}]/u;
+const SKIP_RE_AST = /^[^_*]*?__[^_*]*?\*[^_*]*?(?=__)/;
+const SKIP_RE_UND = /^[^_*]*?\*\*[^_*]*?_[^_*]*?(?=\*\*)/;
+
+/** Char after a delim run in its own scope ('end' if it ends the scope). */
+function afterCharOf(node, s) {
+  if (node.innerEnd) return undefined;
+  return s[node.pos + node.len];
+}
+
+/** Last char of the text token preceding children[idx] ('' after a non-text node). */
+function prevTextChar(children, idx) {
+  if (idx === 0) return '';
+  const prev = children[idx - 1];
+  if (prev.t === 'text' || prev.t === 'raw') {
+    const str = prev.s;
+    return str.length ? str[str.length - 1] : '';
+  }
+  if (prev.t === 'delim') return prev.ch;
+  return '';
+}
+
+/** Last char of a node, in masked-source terms (for a leftover closer's pCh). */
+function lastMaskedChar(node) {
+  if (node.t === 'text' || node.t === 'raw') return node.s.length ? node.s[node.s.length - 1] : '';
+  if (node.t === 'delim') return node.ch;
+  if (node.t === 'br') return '\n';
+  return ']';
+}
+
+/**
+ * End index (in s) of marked's scan-start skip span
+ * (`__...*...__` for '*', `**..._...**` for '_'), or -1.
+ */
+function specialSkipEnd(s, from, ch) {
+  const m = (ch === '*' ? SKIP_RE_AST : SKIP_RE_UND).exec(s.slice(from));
+  return m ? from + m[0].length : -1;
+}
+
+/**
+ * Try marked's emStrong scan for the delim at children[idx] (ch '*' or '_').
+ * Returns {closerIdx, use, tag, literal} or null. `literal` is how many
+ * chars of the opener run were consumed as literal text by failed retries.
+ */
+function tryEmStrongAt(children, idx, s) {
+  const opener = children[idx];
+  const ch = opener.ch;
+  const n0 = prevTextChar(children, idx);
+  const pCh = opener.pCh || '';
+  const afterCh = afterCharOf(opener, s);
+  // LDelim must match: the run is followed by a non-space char.
+  if (afterCh === undefined || isSpace(afterCh)) return null;
+  // GFM LDelim punct (ye) excludes '~'; it has no open-quote lookahead.
+  const dPunct = isPunct(afterCh) && afterCh !== '~';
+  const h = pCh === '*' || pCh === '_' || isPunctNt(pCh);
+  const R = pCh !== '' && !isSpace(pCh) && (dPunct || (ch === '*' && !h));
+  const skipEnd = specialSkipEnd(s, opener.pos + opener.len, ch);
+  // last possible closer: last later run of ch whose before-char is not
+  // whitespace (marked's fe(); a run at the string start counts as
+  // whitespace-before, so pCh '' never qualifies)
+  let v = -1;
+  for (let j = idx + 1; j < children.length; j++) {
+    const c = children[j];
+    if (c.t !== 'delim' || c.len <= 0 || c.ch !== ch) continue;
+    if (c.pCh !== '' && !isSpace(c.pCh)) v = c.pos;
+  }
+  if (v < opener.pos + opener.len) return null;
+  const origLen = opener.len;
+  for (let literal = 0; literal < origLen; literal++) {
+    const k = origLen - literal;
+    // retry `n`: a consumed '*' becomes the last text char (o=true), but a
+    // consumed '_' does not update marked's `r` (text tokens ending in '_'
+    // leave it alone), so '_' retries keep the original n
+    const n = (literal === 0 || ch === '_') ? n0 : ch;
+    const o = n === ch;
+    const u = literal === 0 ? isPunctNt(n0) : h;
+    // '_' guard: followed by a non-punct (ye) non-space char and the
+    // previous char is alphanumeric -> this attempt cannot open
+    if (ch === '_' && !dPunct && afterCh !== '_' && ALNUM_RE.test(n)) continue;
+    // opener gate
+    if (dPunct && n !== '' && !u) continue;
+    let m = k, f = 0;
+    const y = origLen;
+    for (let j = idx + 1; j < children.length; j++) {
+      const c = children[j];
+      if (c.t !== 'delim' || c.len <= 0 || c.ch !== ch) continue;
+      if (c.pos > v) break;
+      if (skipEnd >= 0 && c.pos < skipEnd) continue;
+      const aCh = afterCharOf(c, s);
+      const cls = emScanClass(emCls(c.pCh), aCh === undefined ? 'end' : emCls(aCh), ch);
+      if (cls === 0) continue;
+      const b = c.len;
+      if (cls === 'open') { m += b; continue; }
+      if (cls === 'amb' || R) {
+        if (o && cls === 'amb') break;
+        if (y % 3 !== 0 && (y + b) % 3 === 0) { f += b; continue; }
+      }
+      m -= b;
+      if (m > 0) continue;
+      const usable = Math.min(b, b + m + f);
+      const use = Math.min(k, usable);
+      return { closerIdx: j, usable, use, tag: use % 2 === 1 ? 'em' : 'strong', literal };
+    }
+  }
   return null;
 }
 
-    let opener = null;
-    let openerIdx = -1;
-    for (let j = i - 1; j >= 0; j--) {
-      const o = delims[j];
-      if (o.len === 0 || o.dead || o.ch !== closer.ch || !o.canOpen) continue;
-      // emphasis may not cross a link boundary
-      if (linkAncestor(o) !== linkAncestor(closer)) continue;
-      // rule of 3 (marked/cmark): if either side can both open and close and
-      // the lengths sum to a multiple of 3, this opener is skipped, unless
-      // one of the lengths is itself a multiple of 3
-      const odd = (o.canOpen && o.canClose) || (closer.canOpen && closer.canClose);
-      if (odd && (o.len + closer.len) % 3 === 0 && (o.len % 3 !== 0 || closer.len % 3 !== 0)) continue;
-      opener = o;
-      openerIdx = j;
-      break;
+/**
+ * Try marked's del scan for the '~' delim at children[idx].
+ * The closer run must have exactly the opener's length; groups 3/4 add to
+ * the counter, other groups subtract. No rule of 3, no retries.
+ */
+function tryDelAt(children, idx, s) {
+  const opener = children[idx];
+  const afterCh = afterCharOf(opener, s);
+  // del LDelim: followed by a punct char or a non-space non-'~' char
+  if (afterCh === undefined || isSpace(afterCh) || afterCh === '~') return null;
+  const n0 = prevTextChar(children, idx);
+  if (isPunct(afterCh) && afterCh !== '~' && n0 !== '' && !isPunctNt(n0)) return null;
+  const o = opener.len;
+  let u = -1;
+  for (let j = idx + 1; j < children.length; j++) {
+    const c = children[j];
+    if (c.t !== 'delim' || c.len <= 0 || c.ch !== '~') continue;
+    if (c.pCh !== '' && !isSpace(c.pCh)) u = c.pos;
+  }
+  if (u < opener.pos + opener.len) return null;
+  let p = o;
+  for (let j = idx + 1; j < children.length; j++) {
+    const c = children[j];
+    if (c.t !== 'delim' || c.len <= 0 || c.ch !== '~') continue;
+    if (c.pos > u) break;
+    if (c.len !== o) continue;
+    const cls = emScanClass(emCls(c.pCh), emCls(afterCharOf(c, s)), '~');
+    if (cls === 0) continue;
+    if (cls === 'open') { p += c.len; continue; }
+    p -= c.len;
+    if (p > 0) continue;
+    return { closerIdx: j, usable: o, use: o, tag: 'del', literal: 0 };
+  }
+  return null;
+}
+
+/** Resolve emphasis in one children list (one scope), in place. */
+function resolveEmphasis(children, s) {
+  let idx = 0;
+  while (idx < children.length) {
+    const node = children[idx];
+    if (node.t !== 'delim' || node.len <= 0) { idx++; continue; }
+    const res = node.ch === '~' ? tryDelAt(children, idx, s) : tryEmStrongAt(children, idx, s);
+    if (!res) { idx++; continue; }
+    const opener = children[idx];
+    const closer = children[res.closerIdx];
+    const inner = children.slice(idx + 1, res.closerIdx);
+    // marked strips 1 (em) or 2 (strong) chars off each end of the raw
+    // match; for del it strips the opener length. The rest of the opener
+    // run and of the *usable* closer run stays inside the emphasis; closer
+    // stars past the usable length stay outside as a live delimiter run.
+    const strip = res.tag === 'del' ? opener.len : (res.use % 2 === 1 ? 1 : 2);
+    const newChildren = [];
+    const leftOp = opener.len - res.literal - strip;
+    if (leftOp > 0) {
+      newChildren.push({
+        t: 'delim', ch: opener.ch, len: leftOp, origLen: opener.len,
+        pos: opener.pos + res.literal + strip, pCh: '', innerEnd: false,
+        canOpen: false, canClose: false, p: null, dead: false,
+      });
     }
-    if (!opener) { i++; continue; }
-    const use = opener.len >= 2 && closer.len >= 2 ? 2 : 1;
-    const tag = closer.ch === '~' ? 'del' : use === 1 ? 'em' : 'strong';
-    const emph = { t: tag, c: [], p: opener.p };
-    collectBetween(opener, closer, emph);
-    const plist = opener.p.c;
-    plist.splice(plist.indexOf(opener) + 1, 0, emph);
-    opener.len -= use;
-    closer.len -= use;
-    if (opener.len === 0) plist.splice(plist.indexOf(opener), 1);
-    if (closer.len === 0) {
-      const cl = closer.p.c;
-      cl.splice(cl.indexOf(closer), 1);
+    for (const c of inner) newChildren.push(c);
+    const leftCl = res.usable - strip;
+    if (leftCl > 0) {
+      newChildren.push({
+        t: 'delim', ch: closer.ch, len: leftCl, origLen: closer.len,
+        pos: closer.pos + strip,
+        pCh: inner.length ? lastMaskedChar(inner[inner.length - 1]) : opener.ch,
+        innerEnd: true, canOpen: false, canClose: false, p: null, dead: false,
+      });
     }
-    // delimiters strictly inside the new emphasis are consumed: they can no
-    // longer open or close (marked: *foo _bar* baz_ leaves the _ literal)
-    for (let k = openerIdx + 1; k < i; k++) delims[k].dead = true;
-    // stay on this closer: it may still have length and match another opener
+    const emph = { t: res.tag, c: newChildren, p: opener.p };
+    for (const c of newChildren) c.p = emph;
+    resolveAllEmphasis(newChildren, s);
+    const replacement = [];
+    if (res.literal > 0) replacement.push({ t: 'text', s: opener.ch.repeat(res.literal), p: opener.p });
+    replacement.push(emph);
+    const outsideCl = closer.len - res.usable;
+    if (outsideCl > 0) {
+      replacement.push({
+        t: 'delim', ch: closer.ch, len: outsideCl, origLen: closer.len,
+        pos: closer.pos + res.usable, pCh: closer.ch, innerEnd: false,
+        canOpen: false, canClose: false, p: opener.p, dead: false,
+      });
+    }
+    children.splice(idx, res.closerIdx - idx + 1, ...replacement);
+    idx += replacement.length;
+  }
+}
+
+/** Resolve emphasis in a children list and, recursively, in link children. */
+function resolveAllEmphasis(children, s) {
+  resolveEmphasis(children, s);
+  for (const node of children) {
+    if (node.t === 'link' && node.c) resolveAllEmphasis(node.c, s);
   }
 }
 
@@ -722,7 +909,18 @@ function parseInline(s, refs) {
         canOpen = left; canClose = right;
       }
       flush();
-      const d = { t: 'delim', ch, len: run, origLen: run, canOpen, canClose, p: root, dead: false };
+      // masked-source char before this run (marked's #n): text/raw -> its
+      // last char, code/link/html/img -> ']' (the mask ends those with ']'),
+      // hard break -> '\n', a delimiter run -> its char, start -> ''
+      const pv = nodes[nodes.length - 1];
+      let pCh = '';
+      if (pv) {
+        if (pv.t === 'text' || pv.t === 'raw') pCh = pv.s.length ? pv.s[pv.s.length - 1] : '';
+        else if (pv.t === 'delim') pCh = pv.ch;
+        else if (pv.t === 'br') pCh = '\n';
+        else pCh = ']';
+      }
+      const d = { t: 'delim', ch, len: run, origLen: run, canOpen, canClose, pos: i, pCh, innerEnd: false, p: root, dead: false };
       nodes.push(d);
       delims.push(d);
       i += run;
@@ -799,6 +997,10 @@ function unwrapExtended(nodes) {
         });
       } else {
         const kids = unwrapExtended(children);
+        // scope fix for emphasis inside the link text: the first child
+        // starts the scope (no before-char) and the last delimiter ends it
+        if (kids.length && kids[0].t === 'delim') kids[0].pCh = '';
+        if (kids.length && kids[kids.length - 1].t === 'delim') kids[kids.length - 1].innerEnd = true;
         const link = {
           t: 'link', href: cleanUrl(res.dest), bracket: true,
           title: res.title != null ? processEntities(res.title) : null, c: kids, p: root,
@@ -941,7 +1143,7 @@ function unwrapExtended(nodes) {
     buf += ch; i++;
   }
   flush();
-  processEmphasis(delims);
+  resolveAllEmphasis(root.c, s);
   return root;
 }
 
