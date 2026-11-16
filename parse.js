@@ -812,6 +812,13 @@ function resolveEmphasis(children, s) {
     }
     const emph = { t: res.tag, c: newChildren, p: opener.p };
     for (const c of newChildren) c.p = emph;
+    // scope fix for emphasis inside this node (like the link scope fix):
+    // the first child starts the scope (no before-char) and the last
+    // delimiter ends it (its after-char is the end of the scope, not the
+    // raw source char after the closer — e.g. a ** closer at the end of
+    // a del's content sees end-of-scope, not the ~~ that closed the del)
+    if (newChildren.length && newChildren[0].t === 'delim') newChildren[0].pCh = '';
+    if (newChildren.length && newChildren[newChildren.length - 1].t === 'delim') newChildren[newChildren.length - 1].innerEnd = true;
     resolveAllEmphasis(newChildren, s);
     const replacement = [];
     if (res.literal > 0) replacement.push({ t: 'text', s: opener.ch.repeat(res.literal), p: opener.p });
