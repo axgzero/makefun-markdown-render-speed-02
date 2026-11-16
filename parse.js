@@ -1950,11 +1950,13 @@ function phase2(st, li, s, pos, col) {
         if (st.srcEndsWithNewline) text += '\n';
       } else if (st.lines[after].length > 0) {
         // the trailing newline is kept when the next line is not truly
-        // empty — a whitespace-only line (e.g. a tab) still counts, only
-        // a zero-length line ends the block cleanly — and it stays inside
-        // this container (a following block outside it ends it cleanly)
+        // empty and stays inside this container. A whitespace-only next
+        // line still counts for a comment (type 2) or a pre/script/style
+        // block (type 1) — marked's html regex includes one trailing
+        // newline for those — but for other block tags the trailing blank
+        // lines are stripped, so no newline is kept there.
         const lc = matchContainers(st, after, false);
-        if (lc) text += '\n';
+        if (lc && (hb.type === 1 || hb.type === 2 || !isBlankFrom(st.lines[after], 0))) text += '\n';
       }
       addBlock(st, { t: 'html', text });
       return endLine + 1;
