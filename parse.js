@@ -1846,7 +1846,11 @@ function phase2(st, li, s, pos, col) {
         if (!lc) {
           // a lazy continuation line is still code content, but only when the
           // fence sits in a list item: inside a quote a line without '>'
-          // ends the quote (and the code block) instead
+          // ends the quote (and the code block) instead. And only once the
+          // fence already has content: when the previous line is the fence
+          // opener itself, a non-matching line ends the list instead
+          // (marked's list tokenizer breaks on a lazy line after a fence
+          // begin), leaving the fence empty.
           const top = st.stack[st.stack.length - 1];
           if (!top || top.kind !== 'item') break;
           const raw = st.lines[j];
@@ -1855,6 +1859,7 @@ function phase2(st, li, s, pos, col) {
           let p3 = sk3.pos, run3 = 0;
           while (raw[p3] === fe.ch) { run3++; p3++; }
           if (run3 >= fe.len && isBlankFrom(raw, p3)) { closed = true; break; }
+          if (contentLines.length === 0) break;
           contentLines.push(raw);
           j++;
           continue;
